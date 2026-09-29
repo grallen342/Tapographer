@@ -247,6 +247,8 @@ async function startSession(){
   const { data: { session } } = await sb.auth.getSession();
   if (!session){ net.uid = null; net.me = null; onNet(); return showAuth(authView === "confirm" ? "confirm" : "login", authView === "confirm" ? authMsg : null); }
   if (recovering) return;
+  if (net.me && session.user.id === net.uid){ hideAuth(); loadAll(); return; }   // same player coming back: keep the game
+  const firstUid = net.uid;
   net.uid = session.user.id; net.email = session.user.email;
   try { await loadMe(); } catch(e){ return showAuth("login", {text: friendly(e)}); }
   if (!net.me) return showAuth("login", {text:"Your account has no player profile. Ask the host for help."});
@@ -255,7 +257,10 @@ async function startSession(){
   await loadAll();
   clearInterval(polling);
   polling = setInterval(() => { if (!document.hidden){ loadAll(); refreshSettings(); } }, 45000);
-  if (state.mode === "daily" && !state.done) newGame();
+  const saved = savedProgressUid();
+  if (saved && saved !== net.uid){ clearProgress(); newGame(); }         // someone else's game on this device
+  else if (firstUid !== net.uid && state.mode === "daily" && !state.done && !state.results.length) newGame();
+  else if (state.picks.length) saveProgress();                             // tag the game with this player
 }
 async function initNet(){
   if (!CFG.SUPABASE_URL || !CFG.SUPABASE_ANON_KEY || /YOUR-/.test(CFG.SUPABASE_URL) || !window.supabase) return showAuth("setup");
@@ -271,7 +276,7 @@ async function initNet(){
 }
 
 /* ---------------- sheets ---------------- */
-let sheetKind = null, rankTab = "today", confirmDelete = false;
+let sheetKind = null, rankTab = "rating", confirmDelete = false;
 function openSheet(kind){ sheetKind = kind; confirmDelete = false; renderSheet(); const s = $("#sheet"); s.hidden = false; s.classList.remove("in"); void s.offsetWidth; s.classList.add("in"); }
 function closeSheet(){ $("#sheet").hidden = true; sheetKind = null; }
 function renderSheet(){
@@ -297,21 +302,22 @@ function playerRow(x, i, showDuel, by){
    Served by the database (public.leaderboard) so everyone sees the same board, even before logging in.
    If the database hasn't been updated yet, it falls back to what this browser already knows. */
 const BOARDS = {
-  today:  {tab:"Today",     unit:"today",  empty:"Nobody has finished today's Daily yet. Be the first!",
+  rating: {tab:"All-time", unit:"rating", empty:"Nobody has played a ranked game yet.",
+           note:`All-time skill rating from every ranked game (Random, Daily and Duels). Beat the score your rating predicts to climb. Everyone starts at ${START_RATING}; "new" means fewer than ${PROVISIONAL} ranked games.`},
+  avg:    {tab:"Average",  unit:"avg",    empty:"Nobody has played a ranked game yet.",
+           note:"All-time average score across Random, Daily and Duel games, out of 1000."},
+  week:   {tab:"Week",     unit:"avg",    empty:"Nobody has played a ranked game in the last 7 days.",
+           note:"Average score over the last 7 days of Random, Daily and Duel games."},
+  today:  {tab:"Today",    unit:"today",  empty:"Nobody has finished today's Daily yet. Be the first!",
            note:"Today's Daily: the same five places for everyone. One try each; resets at midnight."},
-  week:   {tab:"Week", unit:"avg",    empty:"Nobody has 3 ranked games in the last 7 days yet.",
-           note:"Average score over the last 7 days of Random, Daily and Duel games (3 games to qualify)."},
-  rating: {tab:"Rating",    unit:"rating", empty:"Nobody is ranked yet. Play 5 ranked games to get on the board.",
-           note:`Skill rating moves after every ranked game (Random, Daily and Duels). Beat the score your rating predicts to climb; everyone starts at ${START_RATING} and appears after ${PROVISIONAL} ranked games.`},
-  avg:    {tab:"All-time",  unit:"avg",    empty:"Nobody has 3 ranked games yet.",
-           note:"All-time average score across Random, Daily and Duel games, out of 1000 (3 games to qualify)."},
 };
 const boardCache = {};   // period -> {t, rows, local}
 async function fetchBoard(period, fresh){
   const c = boardCache[period];
   if (c && !fresh && Date.now() - c.t < 30000) return c;
   let rows = null, local = false;
-  if (sb){
+  if (net.uid && period !== "week" && Object.keys(net.profiles).length){ rows = localBoard(period); local = true; }
+  else if (sb){
     try {
       const { data, error } = await sb.rpc("leaderboard", {p_period: period, p_day: todayKey(), p_limit: 100});
       if (!error) rows = data;            // null = the host hid the board from signed-out visitors
@@ -327,8 +333,8 @@ function localBoard(period){
   const key = todayKey(), P = players();
   const row = (x, value, extra) => Object.assign({id: x.id, username: x.p.username, avatar: x.p.avatar, color: x.p.color, value}, extra);
   if (period === "today") return P.filter(x => x.p.daily && x.p.daily.date === key).sort((a, b) => b.p.daily.score - a.p.daily.score).map(x => row(x, x.p.daily.score, {raws: x.p.daily.raws}));
-  if (period === "rating") return P.filter(x => !isProvisional(x.p)).sort((a, b) => ratingOf(b.p) - ratingOf(a.p)).map(x => row(x, ratingOf(x.p), {games: x.p.rated_games, avg: x.p.avg}));
-  if (period === "avg") return P.filter(x => (x.p.games || 0) >= 3).sort((a, b) => (b.p.avg || 0) - (a.p.avg || 0)).map(x => row(x, x.p.avg || 0, {games: x.p.games, best: x.p.best}));
+  if (period === "rating") return P.filter(x => (x.p.rated_games || 0) >= 1).sort((a, b) => (ratingOf(b.p) - ratingOf(a.p)) || ((b.p.avg || 0) - (a.p.avg || 0))).map(x => row(x, ratingOf(x.p), {games: x.p.rated_games, avg: x.p.avg}));
+  if (period === "avg") return P.filter(x => (x.p.games || 0) >= 1).sort((a, b) => ((b.p.avg || 0) - (a.p.avg || 0)) || ((b.p.best || 0) - (a.p.best || 0))).map(x => row(x, x.p.avg || 0, {games: x.p.games, best: x.p.best}));
   return null;   // "week" needs the database
 }
 function boardSub(period, r){
@@ -341,23 +347,20 @@ function boardRow(period, r, i, opts = {}){
   const me = r.id === net.uid, medal = ["🥇","🥈","🥉"][i];
   return h("li", {class: (me ? "me " : "") + (i < 3 ? "podium p" + (i + 1) : "")},
     h("span", {class:"rk" + (medal ? " medal" : ""), text: medal || String(i + 1)}), avatarEl(r, "md"),
-    h("span", {class:"who"}, h("b", {text: (r.username || "Someone") + (me ? " (you)" : "")}), h("span", {text: boardSub(period, r)})),
+    h("span", {class:"who"}, h("b", null, h("span", {class:"nm", text: r.username || "Someone"}), period === "rating" && (r.games || 0) < PROVISIONAL ? h("span", {class:"prov", text:"new"}) : null), h("span", {text: (me ? "you · " : "") + boardSub(period, r)})),
     h("span", {class:"val"}, String(r.value), h("small", {text: BOARDS[period].unit})),
     opts.duel ? (!me && canPlay() ? h("button", {class:"secondary small", text:"Duel", onclick: () => challenge(r.id)})
                                  : h("button", {class:"secondary small", text:"Duel", tabindex:"-1", "aria-hidden":"true", style:"visibility:hidden"})) : null);
 }
 function myBoardHint(period, rows){
   const p = myProfile(); if (!p || !rows || rows.some(r => r.id === net.uid)) return null;
-  const left = PROVISIONAL - (p.rated_games || 0);
   if (period === "today"){
     const played = p.daily && p.daily.date === todayKey();
     if (played) return null;
     return h("div", {class:"myspot"}, h("span", {text:"You haven't played today's Daily yet."}),
       h("button", {class:"primary small", text:"Play the Daily", onclick: () => { closeSheet(); state.mode = "daily"; state.duel = null; renderModes(); newGame(); }}));
   }
-  if (period === "rating" && left > 0) return h("div", {class:"myspot", text:`Play ${left} more ranked game${left === 1 ? "" : "s"} (Random, Daily or Duel) to appear here.`});
-  if (period === "rating") return h("div", {class:"myspot", text:`Your rating: ${ratingOf(p)}`});
-  return h("div", {class:"myspot", text:"Play 3 ranked games (Random, Daily or Duel) to qualify."});
+  return h("div", {class:"myspot", text:"Play a ranked game (Random, Daily or Duel) to get on the board."});
 }
 let rankLoad = 0;
 function renderRank(body, title){
@@ -386,13 +389,11 @@ function openBoard(period){ if (period) rankTab = period; loadAll(); openSheet("
 async function renderAuthBoard(){
   const box = $("#authboard"); if (!box) return;
   if (!sb){ box.hidden = true; return; }
-  const today = await fetchBoard("today");
-  let period = "today", res = today;
-  if (!today.rows || !today.rows.length){ period = "rating"; res = await fetchBoard("rating"); }
+  const period = "rating", res = await fetchBoard("rating");
   if (!res.rows || !res.rows.length){ box.hidden = true; return; }
   box.replaceChildren(
-    h("div", {class:"abhead"}, h("span", {class:"trophy", text:"🏆"}), h("b", {text: period === "today" ? "Today's leaderboard" : "Top players"}),
-      h("span", {class:"abnote", text: period === "today" ? "Daily scores" : "Skill rating"})),
+    h("div", {class:"abhead"}, h("span", {class:"trophy", text:"🏆"}), h("b", {text:"Leaderboard"}),
+      h("span", {class:"abnote", text:"All-time"})),
     h("ul", {class:"board lb mini"}, ...res.rows.slice(0, 5).map((r, i) => boardRow(period, r, i))),
     h("p", {class:"abfoot", text:"Create an account to get on the board."}));
   box.hidden = $("#auth").hidden;
@@ -512,7 +513,7 @@ function wire(){
   $("#zin").onclick = () => { stopAnim(); flyTo([view.lam, view.phi], clamp(view.k*1.8, KMIN, KMAX), 260); };
   $("#zout").onclick = () => { stopAnim(); flyTo([view.lam, view.phi], clamp(view.k/1.8, KMIN, KMAX), 260); };
   $("#nb-rank").onclick = () => canPlay() && openBoard();
-  $("#seeboard").onclick = () => canPlay() && openBoard(state.mode === "daily" ? "today" : "week");
+  $("#seeboard").onclick = () => canPlay() && openBoard(state.mode === "daily" ? "today" : "rating");
   $("#nb-duel").onclick = () => canPlay() && (loadAll(), openSheet("duels"));
   $("#nb-me").onclick = () => canPlay() ? openSheet("me") : showAuth("login");
   $("#nb-admin").onclick = () => { location.href = "admin.html"; };
@@ -546,7 +547,7 @@ function wire(){
   buildDensity();   // population density fades in once it's ready
   initGestures(p => { if (canPlay()) handleTap(p); });
   layout();
-  newGame();
+  if (!resumeGame()) newGame();   // pick up where you left off, if a game was in progress
   $("#loading").hidden = true;
   (function spin(){ if (!$("#auth").hidden && !anim){ view.lam += 0.06; draw(false); } requestAnimationFrame(spin); })();
   await netReady;

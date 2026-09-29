@@ -269,3 +269,7 @@
   .overlay.auth{align-content:flex-start;padding-block:24px}
   .authboard{max-width:430px}
 }
+.board.lb .who b{display:flex;align-items:center;gap:6px;min-width:0}
+.board.lb .who b .nm{font:inherit;color:inherit;letter-spacing:0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.board.lb .who b .prov{flex-shrink:0;margin-left:0}
+#sheet .tabs button{white-space:nowrap}

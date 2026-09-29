@@ -209,7 +209,7 @@ function handleTap(p){
   const ll = unproject(p[0], p[1]); if (!ll) return;
   state.guess = ll;
   buildPins();
-  if (mode().kind === "blitz") lockIn(); else updateDock();
+  if (mode().kind === "blitz") lockIn(); else { updateDock(); saveProgress(); }
 }
 
 function updatePrompt(){
@@ -280,6 +280,7 @@ function lockIn(){
   const kT = clamp(0.62 / Math.max(Math.sin(Math.min(d, 1.4)), 0.012), 1, 20);
   flyTo(mid, kT, mode().kind === "blitz" ? 500 : 1100);
   if (mode().kind === "blitz") setTimeout(() => { if (state.revealed && mode().kind === "blitz") next(); }, 1300);
+  saveProgress();
 }
 function countUp(el, from, to){
   const t0 = performance.now(), dur = 550;
@@ -293,6 +294,7 @@ function startRound(){
   if (m.kind === "region") flyTo(m.center, m.zoom, 800);
   else flyTo([view.lam, clamp(view.phi, -35, 45)], 1, 800);
   if (m.kind === "blitz") resumeBlitz();
+  saveProgress();
 }
 function next(){
   if (!state.revealed) return;
@@ -337,6 +339,56 @@ function newGame(){
   }
   startRound();
 }
+/* ---------------- keep the game when you leave the page ----------------
+   Phones often reload a page that's been in the background (answering a text, switching apps).
+   The game in progress is saved on this device after every step and picked back up on return. */
+const PROGRESS_KEY = "tapo.progress";
+function saveProgress(){
+  try {
+    if (!state.picks.length) return;
+    if (mode().kind === "blitz" && !state.revealed && !state.done) pauseBlitz(), resumeBlitz();   // bank the clock
+    localStorage.setItem(PROGRESS_KEY, JSON.stringify({
+      v: 1, uid: (typeof net !== "undefined" && net.uid) || null, t: Date.now(), day: todayKey(),
+      mode: state.mode, duel: state.duel, picks: state.picks, round: state.round, results: state.results,
+      guess: state.guess, revealed: state.revealed, done: state.done, blitzLeft: state.blitzLeft,
+      view: {lam: view.lam, phi: view.phi, k: view.k},
+    }));
+  } catch(e){}
+}
+function clearProgress(){ try { localStorage.removeItem(PROGRESS_KEY); } catch(e){} }
+function loadProgress(){
+  try {
+    const g = JSON.parse(localStorage.getItem(PROGRESS_KEY) || "null");
+    if (!g || g.v !== 1 || !MODES[g.mode] || !Array.isArray(g.picks) || g.picks.length !== ROUNDS) return null;
+    if (Date.now() - g.t > 12*3600e3) return null;              // stale after 12 hours
+    if (MODES[g.mode].daily && g.day !== todayKey()) return null; // yesterday's Daily is over
+    return g;
+  } catch(e){ return null; }
+}
+/* Put a saved game back on screen. Returns false if there was nothing to resume. */
+function resumeGame(){
+  const g = loadProgress(); if (!g) return false;
+  cancelAnimationFrame(state.blitzTimer);
+  Object.assign(state, {mode: g.mode, duel: g.duel, picks: g.picks, round: g.round, results: g.results,
+                        guess: g.guess, revealed: g.revealed, done: g.done, blitzLeft: g.blitzLeft});
+  if (g.view){ view.lam = g.view.lam; view.phi = g.view.phi; view.k = clamp(g.view.k, KMIN, KMAX); }
+  renderModes();
+  $("#summary").hidden = true;
+  buildPins(); updatePrompt(); updateDock(); layout();
+  $("#total").textContent = total();
+  if (state.done){ showSummary(false); return true; }
+  if (mode().kind === "blitz" && !state.revealed){
+    state.blitzLeft -= Math.max(0, Date.now() - g.t);           // the clock kept running while you were away
+    if (state.blitzLeft <= 0){ state.blitzLeft = 0; timeUp(); } else resumeBlitz();
+  }
+  if (mode().kind === "blitz" && state.revealed) setTimeout(() => { if (state.revealed) next(); }, 600);
+  requestDraw(true);
+  return true;
+}
+function savedProgressUid(){ const g = loadProgress(); return g ? g.uid : null; }
+document.addEventListener("visibilitychange", () => { if (document.hidden) saveProgress(); });
+window.addEventListener("pagehide", saveProgress);
+
 function savedDaily(){
   const p = myProfile();
   return p && p.daily && p.daily.date === todayKey() ? p.daily : null;
@@ -353,6 +405,7 @@ const GRADES = [
 
 async function finish(){
   state.done = true;
+  saveProgress();
   showSummary(false, null, true);            // show the result right away while it saves
   const res = await recordGame();
   if (!$("#summary").hidden) showSummary(res.isBest, res.delta, false, res.error);
