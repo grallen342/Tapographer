@@ -305,6 +305,124 @@ function paintTexture(){
   tex8 = img.data; tex32 = new Uint32Array(tex8.buffer);
 }
 
+/* ---------------- real imagery: NASA Blue Marble + night lights (public domain) ----------------
+   Served by jsDelivr/unpkg from the three-globe package. If they can't load, the painted map above is used. */
+const IMG_VER = "2.45.2";
+const IMAGERY = [`https://cdn.jsdelivr.net/npm/three-globe@${IMG_VER}/example/img/earth-blue-marble.jpg`,
+                 `https://unpkg.com/three-globe@${IMG_VER}/example/img/earth-blue-marble.jpg`];
+const NIGHT   = [`https://cdn.jsdelivr.net/npm/three-globe@${IMG_VER}/example/img/earth-night.jpg`,
+                 `https://unpkg.com/three-globe@${IMG_VER}/example/img/earth-night.jpg`];
+let imagerySource = "painted";
+
+function loadImage(urls, ms = 20000){
+  return new Promise((resolve, reject) => {
+    let i = 0;
+    const next = () => {
+      if (i >= urls.length) return reject(new Error("image failed"));
+      const im = new Image(), url = urls[i++];
+      let done = false;
+      const t = setTimeout(() => { if (!done){ done = true; im.src = ""; next(); } }, ms);
+      im.crossOrigin = "anonymous";
+      im.decoding = "async";
+      im.onload = () => { if (done) return; done = true; clearTimeout(t); resolve(im); };
+      im.onerror = () => { if (done) return; done = true; clearTimeout(t); next(); };
+      im.src = url;
+    };
+    next();
+  });
+}
+
+/* Satellite base map. Returns true when it replaced the painted texture. */
+async function loadImagery(pending){
+  const im = await (pending || loadImage(IMAGERY)).catch(() => null);
+  if (!im) return false;
+  try {
+    const small = Math.min(screen.width, screen.height) < 700;
+    const cap = small ? 3072 : 4096;
+    const w = Math.min(cap, im.naturalWidth), h = Math.round(w / 2);
+    const c = document.createElement("canvas"); c.width = w; c.height = h;
+    const g = c.getContext("2d", {willReadFrequently: true});
+    g.imageSmoothingQuality = "high";
+    g.drawImage(im, 0, 0, w, h);
+    const id = g.getImageData(0, 0, w, h), d = id.data;   // throws if the image isn't CORS-clean
+    // gentle grade: a touch more contrast and color, deepen the ocean to sit on the dark UI
+    for (let i = 0; i < d.length; i += 4){
+      let r = d[i], gg = d[i+1], b = d[i+2];
+      const l = .3*r + .59*gg + .11*b;
+      r = l + (r - l)*1.12; gg = l + (gg - l)*1.12; b = l + (b - l)*1.12;
+      r = (r - 128)*1.06 + 124; gg = (gg - 128)*1.06 + 124; b = (b - 128)*1.06 + 126;
+      d[i] = r < 0 ? 0 : r > 255 ? 255 : r; d[i+1] = gg < 0 ? 0 : gg > 255 ? 255 : gg; d[i+2] = b < 0 ? 0 : b > 255 ? 255 : b;
+    }
+    TW = w; TH = h; tex8 = d; tex32 = new Uint32Array(d.buffer);
+    imagerySource = "satellite";
+    computeCoast();
+    return true;
+  } catch(e){ return false; }
+}
+
+/* Population density: NASA night lights, blended with the city and rural population tables,
+   stored as one 0–255 channel the same size as the base map. */
+let DEN = null, denReady = false;
+async function buildDensity(){
+  const w = TW, h = TH, ppd = w / 360;
+  const c = document.createElement("canvas"); c.width = w; c.height = h;
+  const g = c.getContext("2d", {willReadFrequently: true});
+  g.fillStyle = "#000"; g.fillRect(0, 0, w, h);
+  let lights = null;
+  try { lights = await loadImage(NIGHT); } catch(e){}
+  if (lights){
+    try { g.drawImage(lights, 0, 0, w, h); g.getImageData(0, 0, 1, 1); }
+    catch(e){ g.globalCompositeOperation = "source-over"; g.fillStyle = "#000"; g.fillRect(0, 0, w, h); lights = null; }
+  }
+  // soft splats for every city and rural belt (adds density where lights undercount, e.g. South Asia, Africa)
+  const blob = document.createElement("canvas"); blob.width = blob.height = 64;
+  { const bg = blob.getContext("2d"), gr = bg.createRadialGradient(32, 32, 0, 32, 32, 32);
+    gr.addColorStop(0, "rgba(255,255,255,1)"); gr.addColorStop(.35, "rgba(255,255,255,.55)"); gr.addColorStop(1, "rgba(255,255,255,0)");
+    bg.fillStyle = gr; bg.fillRect(0, 0, 64, 64); }
+  g.globalCompositeOperation = "lighter";
+  const put = (lat, lon, rKm, a) => {
+    const r = Math.max(1.2, rKm / 111 * ppd / Math.max(.2, Math.cos(lat*RAD))), ry = Math.max(1.2, rKm / 111 * ppd);
+    const x = (lon + 180) * ppd, y = (90 - lat) * ppd;
+    g.globalAlpha = Math.min(1, a);
+    for (const off of [0, -w, w]) if (x + off + r > 0 && x + off - r < w) g.drawImage(blob, x + off - r, y - ry, r*2, ry*2);
+  };
+  for (const [lat, lon, pop] of CITIES) put(lat, lon, 6 + 16*Math.sqrt(pop/1000), lights ? .06 + Math.min(.22, pop/45000) : .4 + Math.min(.45, pop/20000));
+  for (const [lat, lon, rKm, wgt] of RURAL) put(lat, lon, rKm, (lights ? .06 : .22) * wgt);
+  g.globalAlpha = 1; g.globalCompositeOperation = "source-over";
+  const d = g.getImageData(0, 0, w, h).data;
+  const out = new Uint8Array(w * h);
+  for (let i = 0, j = 0; j < out.length; i += 4, j++){
+    const m = Math.max(d[i], d[i+1], d[i+2]);
+    const v = (m - 14) / 200;                     // drop the faint noise floor
+    if (v <= 0) continue;
+    if (tex8 && w === TW){   // keep it on land: skip water pixels (blue-dominant) in the base map
+      const k = j*4, r = tex8[k], gg = tex8[k+1], b = tex8[k+2];
+      if (b > r + 18 && b >= gg) continue;
+    }
+    out[j] = v >= 1 ? 255 : Math.round(Math.pow(v, .85) * 255);
+  }
+  if (w === TW && h === TH){ DEN = out; denReady = true; requestDraw(true); }
+}
+
+/* Density color ramp (coral → gold → warm white) and how strongly it shows at the current zoom. */
+const DEN_R = new Uint8Array(256), DEN_G = new Uint8Array(256), DEN_B = new Uint8Array(256), DEN_M = new Uint16Array(256);
+{
+  const stops = [[0, [240,96,56]], [.4, [255,140,64]], [.75, [255,190,90]], [1, [255,222,150]]];
+  for (let i = 0; i < 256; i++){
+    const t = i / 255; let k = 0; while (k < stops.length - 2 && t > stops[k+1][0]) k++;
+    const [t0, c0] = stops[k], [t1, c1] = stops[k+1], f = (t - t0) / (t1 - t0);
+    DEN_R[i] = c0[0] + (c1[0]-c0[0])*f; DEN_G[i] = c0[1] + (c1[1]-c0[1])*f; DEN_B[i] = c0[2] + (c1[2]-c0[2])*f;
+  }
+}
+let denK = -1;
+function densityStrength(k){ return clamp(.14 + (k - 1.15) * .19, .14, .78); }   // faint at world view, strong once zoomed in
+function denTable(){
+  if (denK === view.k) return;
+  denK = view.k;
+  const A = densityStrength(view.k);
+  for (let i = 0; i < 256; i++){ const t = i / 255; DEN_M[i] = Math.round(Math.min(1, Math.pow(t, .8) * 1.15) * A * 256); }
+}
+
 /* ---------------- view + rendering ---------------- */
 const view = { lam: Math.random()*360 - 180, phi: Math.random()*50 - 15, k: 1 };
 let canvas, ctx, W = 0, H = 0, dpr = 1, R0 = 200, gcx = 0, gcy = 0;
@@ -339,12 +457,6 @@ function makeStars(){
   const bg = s.createRadialGradient(W*dpr/2, H*dpr*.45, 0, W*dpr/2, H*dpr*.45, Math.max(W, H)*dpr*.8);
   bg.addColorStop(0, "#0B1628"); bg.addColorStop(1, "#03060C");
   s.fillStyle = bg; s.fillRect(0, 0, starCanvas.width, starCanvas.height);
-  const n = Math.round(W*H/2600);
-  for (let i = 0; i < n; i++){
-    const r = Math.random(), a = .25 + Math.random()*.6;
-    s.fillStyle = `rgba(${220+Math.random()*35|0},${225+Math.random()*30|0},255,${a})`;
-    s.fillRect(Math.random()*starCanvas.width, Math.random()*starCanvas.height, r < .92 ? dpr : dpr*1.6, r < .92 ? dpr : dpr*1.6);
-  }
 }
 
 function prepareOverlays(){
@@ -373,6 +485,8 @@ function raster(hi){
   const y0 = Math.max(0, Math.floor(cy - s)), y1 = Math.min(h, Math.ceil(cy + s));
   const bil = hi && view.k > 1.6;
   const d8 = rimg.data;
+  const den = denReady && DEN && DEN.length === TW*TH ? DEN : null;
+  if (den) denTable();
   for (let y = y0; y < y1; y++){
     const Yn = (cy - y - .5)/s, Y2 = Yn*Yn; if (Y2 >= 1) continue;
     const half = Math.sqrt(1 - Y2)*s;
@@ -386,7 +500,14 @@ function raster(hi){
       let u = (Math.atan2(Xn, gx) + lam)/TWO + .5; u -= Math.floor(u);
       const v = .5 - Math.asin(gz)/Math.PI;
       if (!bil){
-        r32[row + x] = tex32[Math.min(TH-1, (v*TH)|0)*TW + ((u*TW)|0) % TW];
+        const ti = Math.min(TH-1, (v*TH)|0)*TW + ((u*TW)|0) % TW;
+        const dv = den ? den[ti] : 0, m = dv ? DEN_M[dv] : 0;
+        if (!m) r32[row + x] = tex32[ti];
+        else {
+          const p = tex32[ti], im = 256 - m;
+          const r = ((p & 255)*im + DEN_R[dv]*m) >> 8, g = (((p >> 8) & 255)*im + DEN_G[dv]*m) >> 8, b = (((p >> 16) & 255)*im + DEN_B[dv]*m) >> 8;
+          r32[row + x] = 0xFF000000 | (b << 16) | (g << 8) | r;
+        }
       } else {
         const fx = u*TW - .5, fy = clamp(v*TH - .5, 0, TH - 1.001);
         const ix = Math.floor(fx), iy = fy|0, tx = fx - ix, ty = fy - iy;
@@ -399,6 +520,12 @@ function raster(hi){
           d8[o+c] = top + (bot - top)*ty;
         }
         d8[o+3] = 255;
+        if (den){
+          const j0 = iy*TW, j1 = iy + 1 < TH ? j0 + TW : j0;
+          const dt = den[j0 + x0] + (den[j0 + x1] - den[j0 + x0])*tx, db = den[j1 + x0] + (den[j1 + x1] - den[j1 + x0])*tx;
+          const dv = (dt + (db - dt)*ty + .5)|0, m = dv ? DEN_M[dv] : 0;
+          if (m){ const im = 256 - m; d8[o] = (d8[o]*im + DEN_R[dv]*m) >> 8; d8[o+1] = (d8[o+1]*im + DEN_G[dv]*m) >> 8; d8[o+2] = (d8[o+2]*im + DEN_B[dv]*m) >> 8; }
+        }
       }
     }
   }
@@ -436,7 +563,7 @@ function draw(hi){
   const c = vec(view.lam, view.phi);
 
   // coastline pen once zoomed, where the painted texture softens
-  const coastA = clamp((view.k - 2.2)/5, 0, .5);
+  const coastA = imagerySource === "satellite" ? clamp((view.k - 4)/10, 0, .22) : clamp((view.k - 2.2)/5, 0, .5);
   if (coastA > 0){
     ctx.beginPath();
     for (const ring of coastRings){
@@ -453,22 +580,6 @@ function draw(hi){
     ctx.strokeStyle = `rgba(235,244,250,${coastA})`; ctx.lineWidth = 1; ctx.stroke();
   }
 
-  // towns and cities: grey urban patches that sharpen with zoom
-  const ppk = s*RAD/111, cosVis = Math.cos(1.5);
-  for (const t of fxCities){
-    const r = t.rKm * ppk; if (r < 1.1) continue;
-    const dot = t.v[0]*c[0] + t.v[1]*c[1] + t.v[2]*c[2]; if (dot < cosVis) continue;
-    const q = project(t.lon, t.lat);
-    if (q[0] + r < 0 || q[0] - r > W || q[1] + r < 0 || q[1] - r > H) continue;
-    const limb = Math.min(1, dot*2.4);
-    ctx.globalAlpha = Math.min(1, (r - 1.1)/5) * .8 * limb;
-    ctx.drawImage(citySprite, q[0]-r, q[1]-r, r*2, r*2);
-    if (r > 7){
-      const cr = Math.max(1.3, r*.16);
-      ctx.globalAlpha = Math.min(1, (r - 7)/10) * .85 * limb;
-      ctx.drawImage(coreSprite, q[0]-cr, q[1]-cr, cr*2, cr*2);
-    }
-  }
   ctx.globalAlpha = 1;
 
   // sunlight falloff toward the limb
@@ -502,7 +613,7 @@ function flyTo(center, kTarget, ms = 1000, done){
   };
   anim = requestAnimationFrame(step);
 }
-const KMIN = .8, KMAX = 30;
+const KMIN = .8, KMAX = 20;
 function zoomAbout(f, px, py){
   const before = px != null ? unproject(px, py) : null;
   view.k = clamp(view.k * f, KMIN, KMAX);

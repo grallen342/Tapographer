@@ -450,10 +450,17 @@ function wire(){
   renderModes(); wire(); onNet();
   layout();
   const netReady = initNet().catch(e => showAuth("login", {text: friendly(e)}));
+  const satP = loadImage(IMAGERY).catch(() => null);   // download the satellite map while the coastlines load
   try { await loadLand(); } catch(e){}
-  $("#loadmsg").textContent = "Painting the planet…";
-  await new Promise(r => setTimeout(r, 30));
-  paintTexture(); sprites(); prepareOverlays();
+  $("#loadmsg").textContent = "Loading satellite imagery…";
+  const sat = await loadImagery(satP);
+  if (!sat){
+    $("#loadmsg").textContent = "Painting the planet…";
+    await new Promise(r => setTimeout(r, 30));
+    paintTexture();
+  }
+  sprites(); prepareOverlays();
+  buildDensity();   // population density fades in once it's ready
   initGestures(p => { if (canPlay()) handleTap(p); });
   layout();
   newGame();
