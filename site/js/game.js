@@ -400,6 +400,8 @@ function showSummary(isBest, delta, saving, error){
     items.push(["Average", p.avg || 0], ["Best", p.best || 0], ["Streak", p.streak || 0]);
     items.forEach(([l, v, x]) => { const b = h("b", {text: String(v)}); if (x) b.append(x); st.append(h("div", null, l, b)); });
   }
+  $("#seeboardtxt").textContent = state.mode === "daily" ? "See today's leaderboard" : "See the leaderboard";
+  $("#seeboard").hidden = !!saving;
   $("#again").textContent = m.daily || state.mode === "duel" ? "Play a random game" : "Play again";
   $("#copy").textContent = "Copy result";
   $("#summary").hidden = false;

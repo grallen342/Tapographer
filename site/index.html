@@ -27,7 +27,7 @@
         Tapographer
       </div>
       <div class="navbtns">
-        <button class="nb" id="nb-rank" aria-label="Rankings"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 2h8v4a4 4 0 0 1-8 0V2Z"/><path d="M4 3H2v1.5A2.5 2.5 0 0 0 4.5 7M12 3h2v1.5A2.5 2.5 0 0 1 11.5 7M8 10v3M5 14h6"/></svg><span class="lbl">Rankings</span></button>
+        <button class="nb" id="nb-rank" aria-label="Leaderboard"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 2h8v4a4 4 0 0 1-8 0V2Z"/><path d="M4 3H2v1.5A2.5 2.5 0 0 0 4.5 7M12 3h2v1.5A2.5 2.5 0 0 1 11.5 7M8 10v3M5 14h6"/></svg><span class="lbl">Leaderboard</span></button>
         <button class="nb" id="nb-duel" aria-label="Duels"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 2l7 7M2 2h3M2 2v3M14 2l-7 7M14 2h-3M14 2v3M5 9l-2 2 2 2 2-2M11 9l2 2-2 2-2-2"/></svg><span class="lbl">Duels</span><span class="badge" id="duelbadge" hidden>0</span></button>
         <button class="nb" id="nb-admin" hidden aria-label="Host control panel"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="7" width="10" height="7" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></svg><span class="lbl">Host</span></button>
         <button class="nb me-chip" id="nb-me" aria-label="Your profile"><span class="av" id="meav">🧭</span><span class="lbl" id="mename">Log in</span><span class="rpill" id="merating" hidden></span></button>
@@ -78,6 +78,7 @@
           <div class="tiles" id="tiles"></div>
         </div>
         <div class="stats" id="stats"></div>
+        <button class="lblink" id="seeboard" type="button"><span aria-hidden="true">🏆</span> <span id="seeboardtxt">See the leaderboard</span> <span aria-hidden="true">→</span></button>
         <div id="duelres"></div>
         <ul class="rows" id="rows"></ul>
         <div class="share" id="sharetext"></div>
@@ -98,6 +99,7 @@
 
   <div class="overlay auth" id="auth" hidden>
     <div class="card authcard" id="authcard" role="dialog" aria-label="Log in or create an account"></div>
+    <aside class="card authboard" id="authboard" aria-label="Leaderboard" hidden></aside>
   </div>
 
   <div class="toast" id="toast" hidden></div>

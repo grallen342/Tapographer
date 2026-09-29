@@ -286,19 +286,23 @@ function renderSettings(body){
   };
   const [t1, signups] = toggle("signups", "New sign-ups", "When off, nobody new can create an account. Existing players keep playing.", s.signups_open);
   const [t2, bonus] = toggle("bonus", "Daily country bonus", "MapTap's safety net in the Daily: right country scores at least 25, right continent at least 10.", s.daily_bonus);
+  const hasBoard = "public_leaderboard" in s;   // present once schema.sql has been re-run
+  const [t3, pubBoard] = toggle("pubboard", "Leaderboard on the sign-in page", "Shows the top 5 players (usernames and scores only) to visitors before they log in.", hasBoard ? s.public_leaderboard : true);
   const invite = h("input", {id:"invite", type:"text", placeholder:"No code: anyone with the link can sign up", value: s.invite_code || "", autocapitalize:"none"});
   const gen = h("button", {class:"secondary small", type:"button", text:"Generate", onclick: () => { invite.value = Math.random().toString(36).slice(2, 8) + "-" + Math.random().toString(36).slice(2, 6); }});
   const clr = h("button", {class:"secondary small", type:"button", text:"Clear", onclick: () => { invite.value = ""; }});
   const ann = h("textarea", {id:"announce", rows:"2", maxlength:"200", placeholder:"Optional message shown at the top of the game for everyone"}); ann.value = s.announcement || "";
   const save = h("button", {class:"primary", text:"Save settings", onclick: async () => {
     save.disabled = true;
-    await act(sb.from("settings").update({signups_open: signups.checked, daily_bonus: bonus.checked, invite_code: invite.value.trim() || null,
-      announcement: ann.value.trim() || null, updated_at: new Date().toISOString()}).eq("id", 1), "Settings saved.");
+    const upd = {signups_open: signups.checked, daily_bonus: bonus.checked, invite_code: invite.value.trim() || null,
+      announcement: ann.value.trim() || null, updated_at: new Date().toISOString()};
+    if (hasBoard) upd.public_leaderboard = pubBoard.checked;
+    await act(sb.from("settings").update(upd).eq("id", 1), "Settings saved.");
     save.disabled = false;
   }});
   body.append(h("div", {class:"actions"}, t1,
     h("div", {class:"act"}, h("div", null, h("b", {text:"Invite code"}), h("span", {text:"When set, new players must enter this code to sign up. Share it with the link."})), h("div", {class:"row"}, invite, gen, clr)),
-    t2,
+    t2, hasBoard ? t3 : null,
     h("div", {class:"act col"}, h("div", null, h("b", {text:"Announcement"}), h("span", {text:"Up to 200 characters, shown as a banner to every player."})), ann)),
     h("div", {class:"btns"}, save));
   body.append(h("h4", {class:"sect", text:"Your game link"}), h("div", {class:"act"}, h("div", null, h("b", {text: siteLink()}), h("span", {text:"Send this to friends. They create their own username, email and password."})),

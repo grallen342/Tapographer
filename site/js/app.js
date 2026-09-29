@@ -52,6 +52,7 @@ async function recordGame(){
     const { data, error } = await sb.rpc("record_game", {p_mode: state.mode, p_raws: raws, p_places: places, p_day: todayKey(), p_duel: state.duel ? state.duel.id : null});
     if (error) throw error;
     net.recentPlaces = places.concat(net.recentPlaces).slice(0, 60);
+    for (const k in boardCache) delete boardCache[k];   // scores changed: refetch the leaderboard next time
     await loadMe(); loadAll();
     if (data.duel_delta != null) toast(`Duel finished: ${data.duel_delta >= 0 ? "+" : ""}${data.duel_delta} rating`);
     return {isBest: data.is_best, delta: data.delta, duelDelta: data.duel_delta};
@@ -111,7 +112,7 @@ function renderDuelResult(){
 
 /* ---------------- sign in / sign up ---------------- */
 let authView = "login", authMsg = null;
-function showAuth(view, msg){ authView = view; authMsg = msg || null; renderAuth(); $("#auth").hidden = false; }
+function showAuth(view, msg){ authView = view; authMsg = msg || null; renderAuth(); $("#auth").hidden = false; renderAuthBoard(); }
 function hideAuth(){ $("#auth").hidden = true; }
 function field(id, label, type, attrs = {}){
   const i = h("input", Object.assign({id, type, name: id}, attrs));
@@ -270,7 +271,7 @@ async function initNet(){
 }
 
 /* ---------------- sheets ---------------- */
-let sheetKind = null, rankTab = "rating", confirmDelete = false;
+let sheetKind = null, rankTab = "today", confirmDelete = false;
 function openSheet(kind){ sheetKind = kind; confirmDelete = false; renderSheet(); const s = $("#sheet"); s.hidden = false; s.classList.remove("in"); void s.offsetWidth; s.classList.add("in"); }
 function closeSheet(){ $("#sheet").hidden = true; sheetKind = null; }
 function renderSheet(){
@@ -292,28 +293,109 @@ function playerRow(x, i, showDuel, by){
     showDuel && !me && canPlay() ? h("button", {class:"secondary small", text:"Duel", onclick: () => challenge(x.id)})
       : showDuel ? h("button", {class:"secondary small", text:"Duel", tabindex:"-1", "aria-hidden":"true", style:"visibility:hidden"}) : h("span"));
 }
-function renderRank(body, title){
-  title.textContent = "Rankings";
-  const tab = (id, label) => h("button", {role:"tab", "aria-selected": rankTab === id ? "true" : "false", text: label, onclick: () => { rankTab = id; renderSheet(); }});
-  body.append(h("div", {class:"tabs", role:"tablist"}, tab("rating", "Skill rating"), tab("avg", "Average"), tab("today", "Today")));
-  const list = h("ul", {class:"board"});
-  if (rankTab !== "today"){
-    const rows = ranked(rankTab); let n = 0;
-    rows.forEach(x => { if (!(rankTab === "avg" ? (x.p.games || 0) < 3 : isProvisional(x.p))) n++; list.append(playerRow(x, n, true, rankTab)); });
-    if (!rows.length) list.append(h("li", {class:"empty", style:"display:block", text:"No players yet."}));
-    body.append(list, h("p", {style:"font-size:13px", text: rankTab === "rating"
-      ? `Skill rating moves after every ranked game (Random, Daily and Duels). Beat the score your rating predicts to climb; duel wins against higher-rated players count for more. Everyone starts at ${START_RATING} and is marked new until ${PROVISIONAL} ranked games.`
-      : "Average score across Random, Daily and Duel games, out of 1000. Marked new until 3 games."}));
-  } else {
-    const key = todayKey();
-    const rows = players().filter(x => x.p.daily && x.p.daily.date === key).sort((a, b) => b.p.daily.score - a.p.daily.score);
-    rows.forEach((x, i) => list.append(h("li", {class: x.id === net.uid ? "me" : ""},
-      h("span", {class:"rk", text: String(i+1)}), avatarEl(x.p, "md"),
-      h("span", {class:"who"}, h("b", {text: (x.p.username || "Someone") + (x.id === net.uid ? " (you)" : "")}), h("span", {text: (x.p.daily.raws || []).map(emoji).join(" ")})),
-      h("span", {class:"val"}, String(x.p.daily.score), h("small", {text:"today"})), h("span"))));
-    if (!rows.length) list.append(h("li", {class:"empty", style:"display:block", text:"Nobody has finished today's Daily yet."}));
-    body.append(list);
+/* ---------------- leaderboard ----------------
+   Served by the database (public.leaderboard) so everyone sees the same board, even before logging in.
+   If the database hasn't been updated yet, it falls back to what this browser already knows. */
+const BOARDS = {
+  today:  {tab:"Today",     unit:"today",  empty:"Nobody has finished today's Daily yet. Be the first!",
+           note:"Today's Daily: the same five places for everyone. One try each; resets at midnight."},
+  week:   {tab:"Week", unit:"avg",    empty:"Nobody has 3 ranked games in the last 7 days yet.",
+           note:"Average score over the last 7 days of Random, Daily and Duel games (3 games to qualify)."},
+  rating: {tab:"Rating",    unit:"rating", empty:"Nobody is ranked yet. Play 5 ranked games to get on the board.",
+           note:`Skill rating moves after every ranked game (Random, Daily and Duels). Beat the score your rating predicts to climb; everyone starts at ${START_RATING} and appears after ${PROVISIONAL} ranked games.`},
+  avg:    {tab:"All-time",  unit:"avg",    empty:"Nobody has 3 ranked games yet.",
+           note:"All-time average score across Random, Daily and Duel games, out of 1000 (3 games to qualify)."},
+};
+const boardCache = {};   // period -> {t, rows, local}
+async function fetchBoard(period, fresh){
+  const c = boardCache[period];
+  if (c && !fresh && Date.now() - c.t < 30000) return c;
+  let rows = null, local = false;
+  if (sb){
+    try {
+      const { data, error } = await sb.rpc("leaderboard", {p_period: period, p_day: todayKey(), p_limit: 100});
+      if (!error) rows = data;            // null = the host hid the board from signed-out visitors
+      else throw error;
+    } catch(e){ rows = localBoard(period); local = true; }
   }
+  const out = {t: Date.now(), rows, local};
+  boardCache[period] = out;
+  return out;
+}
+function localBoard(period){
+  if (!net.uid) return null;
+  const key = todayKey(), P = players();
+  const row = (x, value, extra) => Object.assign({id: x.id, username: x.p.username, avatar: x.p.avatar, color: x.p.color, value}, extra);
+  if (period === "today") return P.filter(x => x.p.daily && x.p.daily.date === key).sort((a, b) => b.p.daily.score - a.p.daily.score).map(x => row(x, x.p.daily.score, {raws: x.p.daily.raws}));
+  if (period === "rating") return P.filter(x => !isProvisional(x.p)).sort((a, b) => ratingOf(b.p) - ratingOf(a.p)).map(x => row(x, ratingOf(x.p), {games: x.p.rated_games, avg: x.p.avg}));
+  if (period === "avg") return P.filter(x => (x.p.games || 0) >= 3).sort((a, b) => (b.p.avg || 0) - (a.p.avg || 0)).map(x => row(x, x.p.avg || 0, {games: x.p.games, best: x.p.best}));
+  return null;   // "week" needs the database
+}
+function boardSub(period, r){
+  if (period === "today") return (r.raws || []).map(emoji).join("");
+  if (period === "rating") return `avg ${r.avg ?? 0} · ${r.games ?? 0} ranked`;
+  if (period === "week") return `${r.games} game${r.games === 1 ? "" : "s"} · best ${r.best}`;
+  return `${r.games} games · best ${r.best ?? 0}`;
+}
+function boardRow(period, r, i, opts = {}){
+  const me = r.id === net.uid, medal = ["🥇","🥈","🥉"][i];
+  return h("li", {class: (me ? "me " : "") + (i < 3 ? "podium p" + (i + 1) : "")},
+    h("span", {class:"rk" + (medal ? " medal" : ""), text: medal || String(i + 1)}), avatarEl(r, "md"),
+    h("span", {class:"who"}, h("b", {text: (r.username || "Someone") + (me ? " (you)" : "")}), h("span", {text: boardSub(period, r)})),
+    h("span", {class:"val"}, String(r.value), h("small", {text: BOARDS[period].unit})),
+    opts.duel ? (!me && canPlay() ? h("button", {class:"secondary small", text:"Duel", onclick: () => challenge(r.id)})
+                                 : h("button", {class:"secondary small", text:"Duel", tabindex:"-1", "aria-hidden":"true", style:"visibility:hidden"})) : null);
+}
+function myBoardHint(period, rows){
+  const p = myProfile(); if (!p || !rows || rows.some(r => r.id === net.uid)) return null;
+  const left = PROVISIONAL - (p.rated_games || 0);
+  if (period === "today"){
+    const played = p.daily && p.daily.date === todayKey();
+    if (played) return null;
+    return h("div", {class:"myspot"}, h("span", {text:"You haven't played today's Daily yet."}),
+      h("button", {class:"primary small", text:"Play the Daily", onclick: () => { closeSheet(); state.mode = "daily"; state.duel = null; renderModes(); newGame(); }}));
+  }
+  if (period === "rating" && left > 0) return h("div", {class:"myspot", text:`Play ${left} more ranked game${left === 1 ? "" : "s"} (Random, Daily or Duel) to appear here.`});
+  if (period === "rating") return h("div", {class:"myspot", text:`Your rating: ${ratingOf(p)}`});
+  return h("div", {class:"myspot", text:"Play 3 ranked games (Random, Daily or Duel) to qualify."});
+}
+let rankLoad = 0;
+function renderRank(body, title){
+  title.textContent = "Leaderboard";
+  const tab = (id) => h("button", {role:"tab", "aria-selected": rankTab === id ? "true" : "false", text: BOARDS[id].tab, onclick: () => { rankTab = id; renderSheet(); }});
+  body.append(h("div", {class:"tabs", role:"tablist"}, ...Object.keys(BOARDS).map(tab)));
+  const list = h("ul", {class:"board lb"}), foot = h("div");
+  body.append(list, foot, h("p", {class:"lbnote", text: BOARDS[rankTab].note}));
+  const period = rankTab, my = ++rankLoad;
+  const paint = (res) => {
+    if (my !== rankLoad || sheetKind !== "rank") return;
+    list.replaceChildren(); foot.replaceChildren();
+    const rows = res && res.rows;
+    if (!rows) list.append(h("li", {class:"empty", style:"display:block", text: period === "week" ? "The weekly board needs the latest database update (re-run schema.sql)." : "The leaderboard isn't available right now."}));
+    else if (!rows.length) list.append(h("li", {class:"empty", style:"display:block", text: BOARDS[period].empty}));
+    else rows.forEach((r, i) => list.append(boardRow(period, r, i, {duel: true})));
+    const hint = myBoardHint(period, rows); if (hint) foot.append(hint);
+  };
+  const cached = boardCache[period];
+  if (cached) paint(cached); else list.append(h("li", {class:"empty", style:"display:block", text:"Loading…"}));
+  fetchBoard(period, true).then(paint);
+}
+function openBoard(period){ if (period) rankTab = period; loadAll(); openSheet("rank"); }
+
+/* A small public board on the sign-in screen, so visitors can see who's on top before they join. */
+async function renderAuthBoard(){
+  const box = $("#authboard"); if (!box) return;
+  if (!sb){ box.hidden = true; return; }
+  const today = await fetchBoard("today");
+  let period = "today", res = today;
+  if (!today.rows || !today.rows.length){ period = "rating"; res = await fetchBoard("rating"); }
+  if (!res.rows || !res.rows.length){ box.hidden = true; return; }
+  box.replaceChildren(
+    h("div", {class:"abhead"}, h("span", {class:"trophy", text:"🏆"}), h("b", {text: period === "today" ? "Today's leaderboard" : "Top players"}),
+      h("span", {class:"abnote", text: period === "today" ? "Daily scores" : "Skill rating"})),
+    h("ul", {class:"board lb mini"}, ...res.rows.slice(0, 5).map((r, i) => boardRow(period, r, i))),
+    h("p", {class:"abfoot", text:"Create an account to get on the board."}));
+  box.hidden = $("#auth").hidden;
 }
 function renderDuels(body, title){
   title.textContent = "Duels";
@@ -429,7 +511,8 @@ function wire(){
   };
   $("#zin").onclick = () => { stopAnim(); flyTo([view.lam, view.phi], clamp(view.k*1.8, KMIN, KMAX), 260); };
   $("#zout").onclick = () => { stopAnim(); flyTo([view.lam, view.phi], clamp(view.k/1.8, KMIN, KMAX), 260); };
-  $("#nb-rank").onclick = () => canPlay() && (loadAll(), openSheet("rank"));
+  $("#nb-rank").onclick = () => canPlay() && openBoard();
+  $("#seeboard").onclick = () => canPlay() && openBoard(state.mode === "daily" ? "today" : "week");
   $("#nb-duel").onclick = () => canPlay() && (loadAll(), openSheet("duels"));
   $("#nb-me").onclick = () => canPlay() ? openSheet("me") : showAuth("login");
   $("#nb-admin").onclick = () => { location.href = "admin.html"; };

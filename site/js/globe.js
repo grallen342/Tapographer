@@ -345,14 +345,7 @@ async function loadImagery(pending){
     g.imageSmoothingQuality = "high";
     g.drawImage(im, 0, 0, w, h);
     const id = g.getImageData(0, 0, w, h), d = id.data;   // throws if the image isn't CORS-clean
-    // gentle grade: a touch more contrast and color, deepen the ocean to sit on the dark UI
-    for (let i = 0; i < d.length; i += 4){
-      let r = d[i], gg = d[i+1], b = d[i+2];
-      const l = .3*r + .59*gg + .11*b;
-      r = l + (r - l)*1.12; gg = l + (gg - l)*1.12; b = l + (b - l)*1.12;
-      r = (r - 128)*1.06 + 124; gg = (gg - 128)*1.06 + 124; b = (b - 128)*1.06 + 126;
-      d[i] = r < 0 ? 0 : r > 255 ? 255 : r; d[i+1] = gg < 0 ? 0 : gg > 255 ? 255 : gg; d[i+2] = b < 0 ? 0 : b > 255 ? 255 : b;
-    }
+    gradePixels(d);   // a touch more contrast and color, to sit on the dark UI
     TW = w; TH = h; tex8 = d; tex32 = new Uint32Array(d.buffer);
     imagerySource = "satellite";
     computeCoast();
@@ -426,7 +419,7 @@ function denTable(){
 /* ---------------- view + rendering ---------------- */
 const view = { lam: Math.random()*360 - 180, phi: Math.random()*50 - 15, k: 1 };
 let canvas, ctx, W = 0, H = 0, dpr = 1, R0 = 200, gcx = 0, gcy = 0;
-let rc, rctx, rimg = null, r32 = null, rW = 0, rH = 0;
+let rc, rctx, rimg = null, rW = 0, rH = 0;
 let starCanvas = null, drawQueued = false, hiTimer = null, interacting = false;
 let fxCities = [], coastRings = [];
 let overlayHook = () => {};   // game draws its arc here
@@ -473,65 +466,186 @@ function requestDraw(hi = false){
   hiTimer = setTimeout(() => { if (!interacting) draw(true); }, hi ? 0 : 160);
 }
 
+/* Write one screen pixel from an equirectangular image (T8/T32, w×h) at image coords fx, fy,
+   with the population-density channel D blended on top. */
+let r32 = null, rd8 = null;
+function samplePx(o, T8, T32, D, w, h, fx, fy, bil, wrap){
+  let r, g, b, dv;
+  if (!bil){
+    let ix = fx|0, iy = fy|0;
+    if (wrap){ ix %= w; if (ix < 0) ix += w; } else if (ix >= w) ix = w - 1; else if (ix < 0) ix = 0;
+    if (iy >= h) iy = h - 1; else if (iy < 0) iy = 0;
+    const t = iy*w + ix;
+    dv = D ? D[t] : 0;
+    const m = dv ? DEN_M[dv] : 0;
+    if (!m){ r32[o] = T32[t]; return; }
+    const p = T32[t]; r = p & 255; g = (p >> 8) & 255; b = (p >> 16) & 255;
+  } else {
+    let x0 = Math.floor(fx - .5), yy = fy - .5;
+    if (yy < 0) yy = 0; else if (yy > h - 1.001) yy = h - 1.001;
+    const tx = fx - .5 - x0, iy = yy|0, ty = yy - iy;
+    let x1;
+    if (wrap){ x0 %= w; if (x0 < 0) x0 += w; x1 = x0 + 1 === w ? 0 : x0 + 1; }
+    else { if (x0 < 0) x0 = 0; if (x0 > w - 1) x0 = w - 1; x1 = x0 + 1 < w ? x0 + 1 : x0; }
+    const j0 = iy*w, j1 = iy + 1 < h ? j0 + w : j0;
+    const a = (j0 + x0)*4, c = (j0 + x1)*4, e = (j1 + x0)*4, f = (j1 + x1)*4;
+    const w00 = (1 - tx)*(1 - ty), w10 = tx*(1 - ty), w01 = (1 - tx)*ty, w11 = tx*ty;
+    r = T8[a]*w00 + T8[c]*w10 + T8[e]*w01 + T8[f]*w11;
+    g = T8[a+1]*w00 + T8[c+1]*w10 + T8[e+1]*w01 + T8[f+1]*w11;
+    b = T8[a+2]*w00 + T8[c+2]*w10 + T8[e+2]*w01 + T8[f+2]*w11;
+    dv = D ? (D[j0 + x0]*w00 + D[j0 + x1]*w10 + D[j1 + x0]*w01 + D[j1 + x1]*w11 + .5)|0 : 0;
+  }
+  const m = dv ? DEN_M[dv] : 0;
+  if (m){ const im = 256 - m; r = (r*im + DEN_R[dv]*m) / 256; g = (g*im + DEN_G[dv]*m) / 256; b = (b*im + DEN_B[dv]*m) / 256; }
+  r32[o] = 0xFF000000 | ((b|0) << 16) | ((g|0) << 8) | (r|0);
+}
+
 function raster(hi){
-  const res = hi ? Math.min(dpr, 1.6) : Math.min(dpr, .8);
+  // phones get a sharper image while you drag and pinch; everyone gets up to 2× pixels when still
+  const res = hi ? Math.min(dpr, 2) : Math.min(dpr, W < 700 ? 1 : .8);
   const w = Math.ceil(W*res), h = Math.ceil(H*res);
   if (!rc){ rc = document.createElement("canvas"); rctx = rc.getContext("2d"); }
-  if (rc.width !== w || rc.height !== h){ rc.width = w; rc.height = h; rimg = rctx.createImageData(w, h); r32 = new Uint32Array(rimg.data.buffer); }
+  if (rc.width !== w || rc.height !== h){ rc.width = w; rc.height = h; rimg = rctx.createImageData(w, h); r32 = new Uint32Array(rimg.data.buffer); rd8 = rimg.data; }
   r32.fill(0);
   const s = S()*res, cx = gcx*res, cy = gcy*res;
   const dp = -view.phi*RAD, cdp = Math.cos(dp), sdp = Math.sin(dp);
   const lam = view.lam*RAD, TWO = 2*Math.PI;
   const y0 = Math.max(0, Math.floor(cy - s)), y1 = Math.min(h, Math.ceil(cy + s));
-  const bil = hi && view.k > 1.6;
-  const d8 = rimg.data;
+  const bil = view.k > 1.6 && (hi || view.k > 3);
   const den = denReady && DEN && DEN.length === TW*TH ? DEN : null;
-  if (den) denTable();
+  denTable();
+  const dt = det;   // high-resolution patch for the area on screen, when loaded
   for (let y = y0; y < y1; y++){
     const Yn = (cy - y - .5)/s, Y2 = Yn*Yn; if (Y2 >= 1) continue;
     const half = Math.sqrt(1 - Y2)*s;
     const xa = Math.max(0, Math.floor(cx - half)), xb = Math.min(w, Math.ceil(cx + half));
     const Ys = Yn*sdp, Yc = Yn*cdp;
-    let row = y*w;
+    const row = y*w;
     for (let x = xa; x < xb; x++){
       const Xn = (x + .5 - cx)/s, r2 = Xn*Xn + Y2; if (r2 >= 1) continue;
       const a = Math.sqrt(1 - r2);
       const gx = a*cdp + Ys, gz = -a*sdp + Yc;
       let u = (Math.atan2(Xn, gx) + lam)/TWO + .5; u -= Math.floor(u);
       const v = .5 - Math.asin(gz)/Math.PI;
-      if (!bil){
-        const ti = Math.min(TH-1, (v*TH)|0)*TW + ((u*TW)|0) % TW;
-        const dv = den ? den[ti] : 0, m = dv ? DEN_M[dv] : 0;
-        if (!m) r32[row + x] = tex32[ti];
-        else {
-          const p = tex32[ti], im = 256 - m;
-          const r = ((p & 255)*im + DEN_R[dv]*m) >> 8, g = (((p >> 8) & 255)*im + DEN_G[dv]*m) >> 8, b = (((p >> 16) & 255)*im + DEN_B[dv]*m) >> 8;
-          r32[row + x] = 0xFF000000 | (b << 16) | (g << 8) | r;
-        }
-      } else {
-        const fx = u*TW - .5, fy = clamp(v*TH - .5, 0, TH - 1.001);
-        const ix = Math.floor(fx), iy = fy|0, tx = fx - ix, ty = fy - iy;
-        const x0 = ((ix % TW) + TW) % TW, x1 = (x0 + 1) % TW;
-        const i00 = (iy*TW + x0)*4, i10 = (iy*TW + x1)*4, i01 = ((iy+1)*TW + x0)*4, i11 = ((iy+1)*TW + x1)*4;
-        const o = (row + x)*4;
-        for (let c = 0; c < 3; c++){
-          const top = tex8[i00+c] + (tex8[i10+c] - tex8[i00+c])*tx;
-          const bot = tex8[i01+c] + (tex8[i11+c] - tex8[i01+c])*tx;
-          d8[o+c] = top + (bot - top)*ty;
-        }
-        d8[o+3] = 255;
-        if (den){
-          const j0 = iy*TW, j1 = iy + 1 < TH ? j0 + TW : j0;
-          const dt = den[j0 + x0] + (den[j0 + x1] - den[j0 + x0])*tx, db = den[j1 + x0] + (den[j1 + x1] - den[j1 + x0])*tx;
-          const dv = (dt + (db - dt)*ty + .5)|0, m = dv ? DEN_M[dv] : 0;
-          if (m){ const im = 256 - m; d8[o] = (d8[o]*im + DEN_R[dv]*m) >> 8; d8[o+1] = (d8[o+1]*im + DEN_G[dv]*m) >> 8; d8[o+2] = (d8[o+2]*im + DEN_B[dv]*m) >> 8; }
+      if (dt){
+        let du = u*360 - 180 - dt.lon0; du -= 360*Math.floor(du/360);   // u = 0 is 180°W
+        const dv = v*180 - dt.top;
+        if (du < dt.wDeg && dv >= 0 && dv < dt.hDeg){
+          if (dt.den) samplePx(row + x, dt.d8, dt.d32, dt.den, dt.w, dt.h, du*dt.ppd, dv*dt.ppd, bil, false);
+          else samplePx(row + x, dt.d8, dt.d32, null, dt.w, dt.h, du*dt.ppd, dv*dt.ppd, bil, false);
+          continue;
         }
       }
+      samplePx(row + x, tex8, tex32, den, TW, TH, u*TW, v*TH, bil, true);
     }
   }
   rctx.putImageData(rimg, 0, 0);
   ctx.imageSmoothingEnabled = true;
   ctx.drawImage(rc, 0, 0, w, h, 0, 0, w/res, h/res);
+  if (hi) scheduleDetail();
+}
+
+/* ---------------- zoomed-in detail: NASA GIBS tiles (Blue Marble + Black Marble, ~500 m per pixel) ----------------
+   Only the tiles covering the screen are fetched, once you stop moving. Tiles use the same
+   lat/lon grid as the base map: level z tiles are 512 px and 288/2^z degrees wide, starting at 180°W, 90°N. */
+const GIBS = "https://gibs.earthdata.nasa.gov/wmts/epsg4326/best/";
+const tileDay = (z, y, x) => `${GIBS}BlueMarble_NextGeneration/default/500m/${z}/${y}/${x}.jpeg`;
+const tileNight = (z, y, x) => `${GIBS}VIIRS_Black_Marble/default/2016-01-01/500m/${z}/${y}/${x}.png`;
+let det = null, detTimer = null, detBusy = false, detOff = false, detFails = 0;
+const tileCache = new Map();
+function tileImg(url){
+  if (!tileCache.has(url)){
+    if (tileCache.size > 300) tileCache.delete(tileCache.keys().next().value);
+    tileCache.set(url, loadImage([url], 15000).catch(() => null));
+  }
+  return tileCache.get(url);
+}
+function gradePixels(d){
+  for (let i = 0; i < d.length; i += 4){
+    let r = d[i], gg = d[i+1], b = d[i+2];
+    const l = .3*r + .59*gg + .11*b;
+    r = l + (r - l)*1.12; gg = l + (gg - l)*1.12; b = l + (b - l)*1.12;
+    r = (r - 128)*1.06 + 124; gg = (gg - 128)*1.06 + 124; b = (b - 128)*1.06 + 126;
+    d[i] = r < 0 ? 0 : r > 255 ? 255 : r; d[i+1] = gg < 0 ? 0 : gg > 255 ? 255 : gg; d[i+2] = b < 0 ? 0 : b > 255 ? 255 : b;
+  }
+}
+function scheduleDetail(){
+  if (detOff) return;
+  clearTimeout(detTimer);
+  detTimer = setTimeout(() => { if (!interacting && !anim && !detBusy) buildDetail(); }, 220);
+}
+function detailPlan(){
+  const s = S(), devPx = Math.min(dpr, 2);
+  const want = 1/(s*RAD)/devPx;                 // degrees per device pixel at the center of the view
+  if (want > (360/TW)*.8) return null;          // the whole-globe image is already sharp enough
+  let z = 2; while (z < 7 && (288/2**z)/512 > want*1.25) z++;
+  // what's on screen, with longitudes unwrapped around the view center
+  let lo = 1e9, hi = -1e9, la = 1e9, lb = -1e9, n = 0;
+  for (let i = 0; i <= 10; i++) for (let j = 0; j <= 10; j++){
+    const q = unproject(W*i/10, H*j/10); if (!q) continue; n++;
+    const L = view.lam + (((q[0] - view.lam) % 360 + 540) % 360 - 180);
+    lo = Math.min(lo, L); hi = Math.max(hi, L); la = Math.min(la, q[1]); lb = Math.max(lb, q[1]);
+  }
+  if (n < 20) return null;
+  const pad = Math.max(hi - lo, lb - la)*.08; lo -= pad; hi += pad; la = Math.max(-90, la - pad); lb = Math.min(90, lb + pad);
+  const maxTiles = W < 700 ? 30 : 42;
+  for (; z >= 2; z--){
+    const D = 288/2**z, rows = Math.ceil(180/D);
+    const c0 = Math.floor((lo + 180)/D), c1 = Math.floor((hi + 180)/D);
+    const r0 = clamp(Math.floor((90 - lb)/D), 0, rows - 1), r1 = clamp(Math.floor((90 - la)/D), 0, rows - 1);
+    const count = (c1 - c0 + 1)*(r1 - r0 + 1);
+    if (count <= maxTiles){
+      if ((D/512) > (360/TW)*.8) return null;   // no sharper than what we have
+      return {z, D, c0, c1, r0, r1, cols: Math.round(360/D)};
+    }
+  }
+  return null;
+}
+async function buildDetail(){
+  const plan = detailPlan();
+  if (!plan){ if (det && view.k < 2) det = null; return; }
+  const {z, D, c0, c1, r0, r1, cols} = plan;
+  if (det && det.z === z && det.c0 <= c0 && det.c1 >= c1 && det.r0 <= r0 && det.r1 >= r1) return;   // already covered
+  detBusy = true;
+  try {
+    const nx = c1 - c0 + 1, ny = r1 - r0 + 1, w = nx*512, h = ny*512;
+    const jobs = [];
+    for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++){
+      const cc = ((c % cols) + cols) % cols;
+      jobs.push(Promise.all([tileImg(tileDay(z, r, cc)), tileImg(tileNight(z, r, cc))]).then(([d, n]) => ({x: (c - c0)*512, y: (r - r0)*512, d, n})));
+    }
+    const tiles = await Promise.all(jobs);
+    if (!tiles.some(t => t.d)){ if (++detFails >= 3) detOff = true; return; }
+    const cv = document.createElement("canvas"); cv.width = w; cv.height = h;
+    const g = cv.getContext("2d", {willReadFrequently: true});
+    g.fillStyle = "#0b1d3a"; g.fillRect(0, 0, w, h);
+    tiles.forEach(t => { if (t.d) g.drawImage(t.d, t.x, t.y, 512, 512); });
+    let d8;
+    try { d8 = g.getImageData(0, 0, w, h).data; } catch(e){ detOff = true; return; }   // tiles not CORS-readable
+    gradePixels(d8);
+    let den = null;
+    if (tiles.some(t => t.n)){
+      g.fillStyle = "#000"; g.fillRect(0, 0, w, h);
+      tiles.forEach(t => { if (t.n) g.drawImage(t.n, t.x, t.y, 512, 512); });
+      try {
+        const nd = g.getImageData(0, 0, w, h).data;
+        den = new Uint8Array(w*h);
+        for (let i = 0, j = 0; j < den.length; i += 4, j++){
+          const m = Math.max(nd[i], nd[i+1], nd[i+2]), v = (m - 22)/190;
+          if (v <= 0) continue;
+          const r = d8[i], gg = d8[i+1], b = d8[i+2];
+          if (b > r + 18 && b >= gg) continue;      // water
+          den[j] = v >= 1 ? 255 : Math.round(Math.pow(v, .85)*255);
+        }
+      } catch(e){ den = null; }
+    }
+    detFails = 0;
+    det = {z, c0, c1, r0, r1, lon0: -180 + c0*D, top: r0*D, wDeg: nx*D, hDeg: ny*D, ppd: 512/D, w, h,
+           d8, d32: new Uint32Array(d8.buffer), den};
+    draw(true);
+  } catch(e){
+    if (++detFails >= 3) detOff = true;
+  } finally { detBusy = false; }
 }
 
 let citySprite = null, coreSprite = null;
@@ -563,7 +677,7 @@ function draw(hi){
   const c = vec(view.lam, view.phi);
 
   // coastline pen once zoomed, where the painted texture softens
-  const coastA = imagerySource === "satellite" ? clamp((view.k - 4)/10, 0, .22) : clamp((view.k - 2.2)/5, 0, .5);
+  const coastA = imagerySource === "satellite" ? 0 : clamp((view.k - 2.2)/5, 0, .5);
   if (coastA > 0){
     ctx.beginPath();
     for (const ring of coastRings){
@@ -613,13 +727,13 @@ function flyTo(center, kTarget, ms = 1000, done){
   };
   anim = requestAnimationFrame(step);
 }
-const KMIN = .8, KMAX = 20;
+const KMIN = .8, KMAX = 40;
 function zoomAbout(f, px, py){
   const before = px != null ? unproject(px, py) : null;
   view.k = clamp(view.k * f, KMIN, KMAX);
   if (before){
     const after = unproject(px, py);
-    if (after){ view.lam -= (after[0] - before[0]); view.phi = clamp(view.phi - (after[1] - before[1]), -85, 85); }
+    if (after){ view.lam -= ((after[0] - before[0] + 540) % 360) - 180; view.phi = clamp(view.phi - (after[1] - before[1]), -85, 85); }
   }
   requestDraw();
 }
@@ -627,10 +741,14 @@ function initGestures(onTap){
   const pts = new Map(); let down = null, moved = false, pinch0 = null, lastMove = 0;
   const pos = e => { const r = canvas.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
   canvas.addEventListener("pointerdown", e => {
-    stopAnim(); canvas.setPointerCapture(e.pointerId);
+    stopAnim(); try { canvas.setPointerCapture(e.pointerId); } catch(err){}
     pts.set(e.pointerId, pos(e));
     if (pts.size === 1){ down = {p: pos(e), t: performance.now()}; moved = false; }
-    if (pts.size === 2){ const [a, b] = [...pts.values()]; pinch0 = {d: Math.hypot(a[0]-b[0], a[1]-b[1]), k: view.k}; moved = true; }
+    if (pts.size === 2){
+      const [a, b] = [...pts.values()];
+      pinch0 = {d: Math.hypot(a[0]-b[0], a[1]-b[1]), k: view.k, anchor: unproject((a[0]+b[0])/2, (a[1]+b[1])/2)};   // zoom toward your fingers
+      moved = true;
+    }
     interacting = true; canvas.classList.add("dragging");
   });
   canvas.addEventListener("pointermove", e => {
@@ -648,6 +766,10 @@ function initGestures(onTap){
       const [a, b] = [...pts.values()];
       const d = Math.hypot(a[0]-b[0], a[1]-b[1]);
       view.k = clamp(pinch0.k * d / Math.max(pinch0.d, 1), KMIN, KMAX);
+      if (pinch0.anchor){
+        const now = unproject((a[0]+b[0])/2, (a[1]+b[1])/2);
+        if (now){ view.lam -= ((now[0] - pinch0.anchor[0] + 540) % 360) - 180; view.phi = clamp(view.phi - (now[1] - pinch0.anchor[1]), -85, 85); }
+      }
       requestDraw();
     }
   });
